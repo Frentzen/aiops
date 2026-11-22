@@ -2,7 +2,7 @@
 
 *Last updated: 22 Nov 2026*
 
-Install one central agent platform, on bare-metal Kubernetes or AKS, then connect target clusters and GitHub through read-only tool servers. The design behind each step is in the [Production Deployment Plan](02-production-plan.md).
+Install one central agent platform, on bare-metal Kubernetes or AKS, then give its agents read-only access to that same cluster and to GitHub through read-only tool servers. Other clusters are out of scope for this stage. The design behind each step is in the [Production Deployment Plan](02-production-plan.md).
 
 ## Choices per environment
 
@@ -19,7 +19,6 @@ The install steps are the same on both; only the supporting services differ.
 | Secret store | Vault or OpenBao, synced by External Secrets Operator | Azure Key Vault, synced by External Secrets Operator |
 | Service account issuer | The cluster's in-cluster issuer | AKS OIDC issuer (enabled at creation) |
 | Outbound control | Firewall or proxy allow-list | NAT gateway plus Azure Firewall allow-list |
-| Path to target clusters | Routed network or VPN | VNet peering or private endpoints |
 
 ## Prerequisites
 
@@ -34,7 +33,6 @@ Tick every item before starting the install.
 - [ ] Secret store and External Secrets Operator
 - [ ] Model provider endpoint and key; outbound allow-list for it
 - [ ] Workstation tools: `helm` v3, `kubectl`, `jq`, `openssl`, `psql` 15+, `kubectl-ate` v1.0.0
-- [ ] Private network path from the platform to each target cluster's API server
 
 ## Prepare the platform cluster
 
@@ -203,7 +201,7 @@ spec:
 EOF
 ```
 
-4. **Outbound address** (give it to GitHub, the model provider and target clusters' allow-lists):
+4. **Outbound address** (give it to GitHub's and the model provider's allow-lists):
 
 ```bash
 IP_ID=$(az aks show -g <rg> -n aiops-platform \
@@ -569,151 +567,75 @@ for ns in kagent ate-system; do
 done | sort -u | grep -v '@sha256:'      # no output
 ```
 
-## Connect a target cluster
+## Connect the cluster's Kubernetes API (in-cluster)
 
-Each target cluster gets one read-only tool server on the platform. It talks to that cluster's own API with a read-only token, so the cluster's RBAC and TLS do the enforcing.
+Agents debug workloads in the same cluster that runs the platform. One read-only tool server runs there with its own service account, bound to `view` only in the namespaces in scope. This is the setup proven in the lab.
 
-### In the target cluster
-
-1. **Read-only service account and token** (repeat the RoleBinding for each namespace in scope):
+1. **Install the tool server without cluster rights.** `rbac.create=false` creates its service account but no ClusterRole. Check the chart's image keys and point them at your registry:
 
 ```bash
-kubectl create namespace aiops-readonly
-kubectl create serviceaccount aiops-reader -n aiops-readonly
-kubectl create rolebinding aiops-view -n <ns> --clusterrole=view \
-  --serviceaccount=aiops-readonly:aiops-reader
-kubectl apply -f - <<'EOF'
-apiVersion: v1
-kind: Secret
-metadata:
-  name: aiops-reader-token
-  namespace: aiops-readonly
-  annotations: {kubernetes.io/service-account.name: aiops-reader}
-type: kubernetes.io/service-account-token
-EOF
+kubectl create namespace aiops-tools --dry-run=client -o yaml | kubectl apply -f -
+helm show values oci://ghcr.io/kagent-dev/tools/helm/kagent-tools --version <pinned> | grep -n -A4 image
+helm upgrade -i kagent-tools-ro oci://ghcr.io/kagent-dev/tools/helm/kagent-tools \
+  -n aiops-tools --version <pinned> --set rbac.create=false
+kubectl get sa,svc -n aiops-tools      # kagent-tools-ro (the -metrics Service is for Prometheus only)
 ```
 
-2. **Build its kubeconfig** (the server must be the API address the platform reaches privately):
+2. **Grant read-only access, one namespace at a time:**
 
 ```bash
-C=<cluster>
-SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
-CA=$(kubectl get secret aiops-reader-token -n aiops-readonly -o jsonpath='{.data.ca\.crt}')
-TOKEN=$(kubectl get secret aiops-reader-token -n aiops-readonly -o jsonpath='{.data.token}' | base64 -d)
-cat > kubeconfig-$C <<EOF
-apiVersion: v1
-kind: Config
-clusters: [{name: $C, cluster: {server: $SERVER, certificate-authority-data: $CA}}]
-users: [{name: aiops-reader, user: {token: $TOKEN}}]
-contexts: [{name: $C, context: {cluster: $C, user: aiops-reader}}]
-current-context: $C
-EOF
+for ns in <ns-1> <ns-2>; do
+  kubectl create rolebinding aiops-view -n $ns --clusterrole=view \
+    --serviceaccount=aiops-tools:kagent-tools-ro
+done
 ```
+
+`view` excludes Secrets but includes ConfigMaps, so check those for plain-text credentials. To add a namespace later, run the loop for it.
 
 3. **Prove it's read-only:**
 
 ```bash
-kubectl --kubeconfig kubeconfig-$C auth can-i list pods -n <ns>      # yes
-kubectl --kubeconfig kubeconfig-$C auth can-i delete pods -n <ns>    # no
-kubectl --kubeconfig kubeconfig-$C auth can-i get secrets -n <ns>    # no
-kubectl --kubeconfig kubeconfig-$C auth can-i list pods -n kube-system   # no
+U=system:serviceaccount:aiops-tools:kagent-tools-ro
+kubectl auth can-i list pods        -n <ns-1>      --as=$U   # yes
+kubectl auth can-i delete pods      -n <ns-1>      --as=$U   # no
+kubectl auth can-i get secrets      -n <ns-1>      --as=$U   # no
+kubectl auth can-i create pods/exec -n <ns-1>      --as=$U   # no
+kubectl auth can-i list pods        -n kube-system --as=$U   # no
 ```
 
-4. **Store it in the secret store, then delete the local file:**
+4. **Network-lock it:** inbound only from the platform, outbound only to the Kubernetes API (no internet, no DNS):
 
 ```bash
-vault kv put aiops/k8s-$C kubeconfig=@kubeconfig-$C
-# AKS: az keyvault secret set --vault-name <kv-name> -n k8s-$C-kubeconfig --file kubeconfig-$C
-shred -u kubeconfig-$C
-```
-
-### In the platform cluster
-
-5. **Tool server for that cluster.** Find the tool server image the chart uses (`helm show values oci://ghcr.io/kagent-dev/tools/helm/kagent-tools --version <pinned> | grep -A4 image`), mirror it, then:
-
-```bash
-kubectl create namespace aiops-tools --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -f - <<EOF
-apiVersion: external-secrets.io/v1
-kind: ExternalSecret
-metadata: {name: k8s-$C-kubeconfig, namespace: aiops-tools}
-spec:
-  secretStoreRef: {kind: ClusterSecretStore, name: platform-secrets}
-  target: {name: k8s-$C-kubeconfig}
-  data:
-  - secretKey: config
-    remoteRef: {key: k8s-$C, property: kubeconfig}    # AKS: key k8s-$C-kubeconfig, no property
----
-apiVersion: apps/v1
-kind: Deployment
-metadata: {name: k8s-$C, namespace: aiops-tools, labels: {app: k8s-$C}}
-spec:
-  replicas: 2
-  selector: {matchLabels: {app: k8s-$C}}
-  template:
-    metadata: {labels: {app: k8s-$C}}
-    spec:
-      automountServiceAccountToken: false
-      containers:
-      - name: tools
-        image: <registry>/kagent-dev/kagent/tools@sha256:<digest>
-        ports: [{containerPort: 8084}]
-        env:
-        - {name: KUBECONFIG, value: /kube/config}
-        - {name: HOME, value: /tmp}
-        volumeMounts:
-        - {name: kubeconfig, mountPath: /kube, readOnly: true}
-        - {name: tmp, mountPath: /tmp}
-        securityContext: {runAsNonRoot: true, allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
-      volumes:
-      - {name: kubeconfig, secret: {secretName: k8s-$C-kubeconfig}}
-      - {name: tmp, emptyDir: {}}
----
-apiVersion: v1
-kind: Service
-metadata: {name: k8s-$C, namespace: aiops-tools}
-spec:
-  selector: {app: k8s-$C}
-  ports: [{port: 8084, targetPort: 8084}]
-EOF
-```
-
-6. **Network-lock it:** inbound only from the platform, outbound only to that cluster's API:
-
-```bash
-kubectl apply -f - <<EOF
+kubectl apply -f - <<'EOF'
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
-metadata: {name: k8s-$C-lockdown, namespace: aiops-tools}
+metadata: {name: kagent-tools-ro-lockdown, namespace: aiops-tools}
 spec:
-  endpointSelector: {matchLabels: {app: k8s-$C}}
+  endpointSelector: {matchLabels: {app.kubernetes.io/instance: kagent-tools-ro}}
   ingress:
   - fromEndpoints:
     - {matchLabels: {k8s:io.kubernetes.pod.namespace: kagent}}
     - {matchLabels: {k8s:io.kubernetes.pod.namespace: ate-system}}
     toPorts: [{ports: [{port: "8084", protocol: TCP}]}]
   egress:
-  - toCIDR: [<target-api-ip>/32]
-    toPorts: [{ports: [{port: "443", protocol: TCP}]}]      # 6443 on most bare-metal clusters
-  - toEndpoints: [{matchLabels: {k8s:io.kubernetes.pod.namespace: kube-system, k8s-app: kube-dns}}]
-    toPorts: [{ports: [{port: "53", protocol: ANY}]}]
+  - toEntities: [kube-apiserver]
 EOF
 ```
 
-7. **Register and bind it:**
+5. **Register it and bind it:**
 
 ```bash
-kubectl apply -f - <<EOF
+kubectl apply -f - <<'EOF'
 apiVersion: api.kagent.dev/v1alpha3
 kind: RemoteMCPServer
-metadata: {name: k8s-$C, namespace: kagent}
+metadata: {name: k8s-readonly, namespace: kagent}
 spec:
-  description: Read-only Kubernetes tools for cluster $C
-  url: http://k8s-$C.aiops-tools.svc.cluster.local:8084/mcp
+  description: Read-only Kubernetes tools for this cluster
+  url: http://kagent-tools-ro.aiops-tools.svc.cluster.local:8084/mcp
   protocol: STREAMABLE_HTTP
   timeout: 30s
 EOF
-kubectl get remotemcpserver k8s-$C -n kagent     # ACCEPTED True
+kubectl get remotemcpserver k8s-readonly -n kagent     # ACCEPTED True
 ```
 
 In the owning team's AgentTemplate, add:
@@ -721,20 +643,20 @@ In the owning team's AgentTemplate, add:
 ```yaml
   tools:
     - mcp:
-        server: {kind: RemoteMCPServer, name: k8s-<cluster>}
+        server: {kind: RemoteMCPServer, name: k8s-readonly}
         tools: [k8s_get_resources, k8s_get_pod_logs, k8s_get_events, k8s_describe_resource, k8s_get_resource_yaml]
 ```
 
-8. **Test isolation, then run the acceptance tests:**
+6. **Test isolation:**
 
 ```bash
-POD=$(kubectl get pods -n aiops-tools -l app=k8s-$C -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl get pods -n aiops-tools -l app.kubernetes.io/instance=kagent-tools-ro -o jsonpath='{.items[0].metadata.name}')
 kubectl debug -n aiops-tools $POD -it --image=curlimages/curl -- sh -c \
- 'sleep 2; curl -sk -m 5 https://<target-api-host>/version >/dev/null && echo API-OK || echo API-BLOCKED;
+ 'sleep 2; curl -sk -m 5 https://$KUBERNETES_SERVICE_HOST/version >/dev/null && echo API-OK || echo API-BLOCKED;
   curl -s -m 5 https://example.com >/dev/null && echo INTERNET-OPEN || echo INTERNET-BLOCKED'
 ```
 
-Rotate the token by recreating `aiops-reader-token` and repeating steps 2 to 4.
+Expected: `API-OK` and `INTERNET-BLOCKED`. The server still offers `shell` and write tools; RBAC and the network lock make them harmless, but never bind them.
 
 ## Connect GitHub
 
@@ -854,7 +776,7 @@ kubectl ate --token-file ~/.ate-token get actor-template -a kagent -o yaml | gre
 
 ## Verify
 
-Run these after the install, after every upgrade, and for each new cluster or system; all must pass before go-live.
+Run these after the install, after every upgrade, and for each new namespace or system; all must pass before go-live.
 
 | Test | How | Pass when |
 | --- | --- | --- |
@@ -875,11 +797,10 @@ Run these after the install, after every upgrade, and for each new cluster or sy
 
 These weren't covered by the lab or by vendor docs; test each on a staging cluster first.
 
-- [ ] **AKS network policy:** that the `toCIDR`, `toEntities` and `toFQDNs` rules behave as expected with Azure CNI powered by Cilium. Microsoft notes its network policies can't use `ipBlock` for node or pod IPs.
+- [ ] **AKS network policy:** that the `toEntities` and `toFQDNs` rules behave as expected with Azure CNI powered by Cilium. Microsoft notes its network policies can't use `ipBlock` for node or pod IPs.
 - [ ] **AKS microVM pool:** that Substrate's microVM workers get `/dev/kvm` on nested-virtualization VM sizes. Until then, AKS runs gVisor only.
 - [ ] **Object storage:** that the bundled RustFS uses the keys in `kagent-rustfs-credentials`, and whether Substrate supports Azure Blob natively.
 - [ ] **Worker scheduling:** the `WorkerPool` fields that pin workers to the agent node pool.
-- [ ] **Remote kubeconfig:** that every bound kagent tool honours `KUBECONFIG` (kubectl does; check others before binding them).
 - [ ] **Header injection:** the v1alpha3 `headersFrom` shape, and that the GitHub token is added outside the sandbox (GitHub step 6 checks it).
 - [ ] **Substrate database TLS on bare metal:** whether Substrate needs a CA setting for `sslmode=verify-full` with a private CA, as kagent does.
 - [ ] **Shared CLI identity:** that removing `ate-client` from `bootstrapOwners` leaves kagent working (it uses its own identity).

@@ -9,7 +9,7 @@ The lab runs kagent 1.0.0 on Agent Substrate in a 2-node DigitalOcean Kubernetes
 | Component | Configuration |
 | --- | --- |
 | Cluster | DigitalOcean Kubernetes (DOKS), server v1.37.2 |
-| Node pool | `pool-bk6u2ul80`: 2 nodes × 4 shared vCPU, 8 GiB RAM, 160 GiB disk (resized up from 2 vCPU / 4 GiB) |
+| Node pool | `pool-<id>`: 2 nodes × 4 shared vCPU, 8 GiB RAM, 160 GiB disk (resized up from 2 vCPU / 4 GiB) |
 | Required APIs | `podcertificaterequests` and `clustertrustbundles` served at `certificates.k8s.io/v1` |
 | Workstation | Windows on ARM laptop; WSL Ubuntu as terminal; kubectl 1.37, Helm v3 |
 | Agent platform | kagent 1.0.0 (namespace `kagent`), installed with the kagent CLI; dev PostgreSQL bundled |

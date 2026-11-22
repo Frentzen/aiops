@@ -90,17 +90,16 @@ Every system the agents read from is added the same way: a read-only tool server
 
 CD platforms need extra care: CI variables and job logs often hold secrets, so block variable and secret endpoints and mask output. For a system without an MCP server, write a small one with typed read-only tools, never a generic HTTP or shell tool.
 
-## Multi-cluster
+## Cluster scope
 
-One central platform serves every cluster. Each target cluster gets one read-only tool server on the platform, which reaches that cluster's own API with a read-only token; commands are in the [Installation Guide](03-installation-guide.md).
+This stage is **in-cluster only**: the agents debug workloads in the same cluster that runs the platform, on bare-metal Kubernetes or AKS.
 
-1. **Target cluster:** a read-only service account (`view` on the namespaces in scope) and its token. Nothing else is installed there.
-2. **Secret store:** the cluster's kubeconfig, holding only that token, readable only by its tool server.
-3. **Platform:** one tool server per cluster (`k8s-<cluster>`), network-locked to that cluster's API address, registered as a `RemoteMCPServer`.
-4. **Teams:** each AgentTemplate binds only the clusters and read tools that team owns.
-5. **Onboarding:** a cluster goes live only after the acceptance tests pass; tokens are rotated on a schedule.
+1. **One read-only tool server** runs in the cluster with its own service account and no cluster-wide rights.
+2. **`view` RoleBindings** grant it read access to the namespaces in scope, one by one. No Secrets, no exec.
+3. **A network policy** limits it to the Kubernetes API. Nothing else is reachable.
+4. **Teams** bind its read tools in their AgentTemplates; adding a namespace means adding a RoleBinding.
 
-The platform holds a read-only token for every cluster, which makes it a high-value target: keep its secret store, egress gateway and admin access tightly controlled.
+Other clusters are out of scope for now. The same pattern can extend to them later: one read-only tool server per cluster, with that cluster's own read-only token.
 
 ## Teams and agents
 
